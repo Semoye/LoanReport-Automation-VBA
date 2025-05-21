@@ -1,0 +1,235 @@
+ VBA Module: ProcessAllSellerFiles
+' Author: Sola Adesemoye
+' Purpose: Automates seller file validation, macro execution, CECL handling, and SQL-ready file generation.
+
+
+# Seller File Automation (Access + VBA)
+
+This project automates the transformation of seller loan files using Microsoft Access and Excel VBA. It is designed to streamline the reporting process for credit unions managing loan participations.
+
+---
+
+## 🔧 What It Does
+
+- Automatically loads incoming seller Excel files
+- Copies loan data into a macro-enabled file for pool-specific formatting
+- Handles a second macro pass for CECL summation, remittance prep, or column reordering
+- Validates output files (ensuring calculated columns equal zero)
+- Outputs cleaned files to a SQL-ready folder or a Rejects folder for follow-up
+
+---
+
+## 📂 How It Works
+
+1. **Seller files** are dropped into an "Incoming" folder.
+2. The VBA script (in Access) scans each file and pulls matching macro settings from a lookup table (`MacroMap`).
+3. It optionally runs a **reorder macro**, then a **main macro** for formatting.
+4. It validates each output:
+   - If all formulas pass (e.g. check column = 0), the cleaned file is saved to the SQL folder.
+   - If not, the file is moved to a Rejects folder and logged in `reject_log.txt`.
+
+---
+
+## 🧠 Why It Matters
+
+Credit union analysts often waste hours copying/pasting loan data across dozens of macro templates. This solution reduces that to minutes, ensures data accuracy, and supports regulatory compliance with minimal manual work.
+
+---
+
+## 👨‍💻 Tech Used
+
+- Microsoft Access (VBA)
+- Excel Macros (.xlsm files)
+- SQL-ready file prep (xlsx)
+
+---
+
+## 📁 File
+
+- [`ProcessAllSellerFiles.bas`](ProcessAllSellerFiles.bas): Main VBA module for automation.
+
+---
+
+## 💡 Future Improvements
+
+- Add email notifications to sellers on rejection
+- Integrate Task Scheduler for background automation
+
+
+
+VBA CODE
+
+Function GetMacroName(poolID As String) As String
+    Dim db As DAO.Database
+    Dim rs As DAO.Recordset
+    Set db = CurrentDb() '-- Connects to the current Access database
+    Set rs = db.OpenRecordset("SELECT * FROM MacroMap WHERE PoolID = '" & poolID & "'", dbOpenSnapshot) '-- Queries MacroMap table for given poolID
+    If Not rs.EOF Then GetMacroName = rs!MacroName Else GetMacroName = "" '-- Returns MacroName if found, otherwise empty
+    rs.Close: Set rs = Nothing: Set db = Nothing '-- Cleanup
+End Function
+
+Function GetMacroFile(poolID As String) As String
+    Dim db As DAO.Database
+    Dim rs As DAO.Recordset
+    Set db = CurrentDb() '-- Connects to the current Access database
+    Set rs = db.OpenRecordset("SELECT * FROM MacroMap WHERE PoolID = '" & poolID & "'", dbOpenSnapshot) '-- Queries MacroMap table for given poolID
+    If Not rs.EOF Then GetMacroFile = rs!MacroFile Else GetMacroFile = "" '-- Returns MacroFile if found, otherwise empty
+    rs.Close: Set rs = Nothing: Set db = Nothing '-- Cleanup
+End Function
+
+Function ProcessAllSellerFiles() As Boolean
+    On Error GoTo HandleError '-- Sets up error handling
+
+    Dim incomingPath As String, macroPath As String, outputPath As String
+    Dim archivePath As String, sqlReadyPath As String, rejectPath As String
+    Dim FileName As String, poolID As String, shortPoolID As String
+    Dim MacroFile As String, MacroName As String, savePath As String
+    Dim xlApp As Object, sellerWb As Object, macroWb As Object
+    Dim sellerWs As Object, macroWs As Object
+
+    '-- Define folders used in the process
+    incomingPath = "Z:\\Microsoft Access Test\\SOLAS MS ACCESS TEST ENVIRONMENT\\Incoming Seller Files\\"
+    macroPath = "Z:\\Microsoft Access Test\\SOLAS MS ACCESS TEST ENVIRONMENT\\Macro Enabled Excel Files\\"
+    outputPath = "Z:\\Microsoft Access Test\\SOLAS MS ACCESS TEST ENVIRONMENT\\Processed Files\\"
+    archivePath = "Z:\\Microsoft Access Test\\SOLAS MS ACCESS TEST ENVIRONMENT\\Archived Files\\"
+    sqlReadyPath = "Z:\\Microsoft Access Test\\SOLAS MS ACCESS TEST ENVIRONMENT\\SQL Ready\\"
+    rejectPath = "Z:\\Microsoft Access Test\\SOLAS MS ACCESS TEST ENVIRONMENT\\Rejects\\"
+
+    Set xlApp = CreateObject("Excel.Application") '-- Start Excel in background
+    xlApp.Visible = False
+    xlApp.ScreenUpdating = False
+
+    FileName = Dir(incomingPath & "*.xlsx") '-- Get first Excel file in Incoming folder
+
+    Do While FileName <> ""
+        poolID = Replace(FileName, ".xlsx", "") '-- Remove extension to get poolID
+        shortPoolID = Replace(poolID, "LP_", "") '-- Shorten poolID for naming
+        MacroFile = GetMacroFile(poolID) '-- Get macro file for this poolID
+        MacroName = GetMacroName(poolID) '-- Get macro name for this poolID
+
+        If MacroFile = "" Or MacroName = "" Then GoTo SkipFile '-- Skip if mapping not found
+
+        Set sellerWb = xlApp.Workbooks.Open(incomingPath & FileName) '-- Open seller file
+        Set sellerWs = sellerWb.Sheets(1) '-- Get first sheet
+        Set macroWb = xlApp.Workbooks.Open(macroPath & MacroFile) '-- Open macro-enabled file
+        Set macroWs = macroWb.Sheets(1) '-- Get first sheet
+
+        Dim fileDateCol As Long: fileDateCol = 0 '-- Column that holds 'File Date'
+
+        '-- Try fixed position first
+        If IsDate(sellerWs.Cells(2, 33).Value) Then
+            fileDateCol = 33
+        Else
+            '-- Try matching common header names near Column 33
+            Dim colIndex As Long, closestCol As Long, minDistance As Long
+            minDistance = 99: closestCol = 0
+            For colIndex = 30 To 35
+                Dim headerText As String
+                headerText = Trim(LCase(sellerWs.Cells(1, colIndex).Value))
+                If headerText = "file date" Or headerText = "date" Or headerText = "extractdate" Then
+                    If Abs(33 - colIndex) < minDistance Then
+                        minDistance = Abs(33 - colIndex)
+                        closestCol = colIndex
+                    End If
+                End If
+            Next colIndex
+            If closestCol > 0 Then fileDateCol = closestCol Else GoTo SkipFile '-- If still not found, skip file
+        End If
+
+        '-- Check if file has at least 2 rows
+        Dim lastRow As Long: lastRow = sellerWs.Cells(sellerWs.Rows.Count, 1).End(-4162).Row
+        If lastRow <= 1 Then GoTo SkipFile
+
+        macroWs.Range("A2:AG" & lastRow).ClearContents '-- Clear old data
+        Dim dataRange As Object
+        Set dataRange = sellerWs.Range("A2").Resize(lastRow - 1, fileDateCol)
+        If Not dataRange Is Nothing Then
+            macroWs.Range("A2").Resize(dataRange.Rows.Count, dataRange.Columns.Count).Value = dataRange.Value '-- Copy data into macro workbook
+        End If
+
+        '-- CECL column logic
+        Dim ceclCol As Long: ceclCol = 0
+        For colIndex = 1 To sellerWs.UsedRange.Columns.Count
+            If Trim(LCase(sellerWs.Cells(1, colIndex).Value)) = "cecl" Then
+                ceclCol = colIndex
+                Exit For
+            End If
+        Next colIndex
+
+        '-- If CECL column exists, calculate total or take row 2 value
+        If ceclCol > 0 Then
+            Dim total As Double: total = 0
+            Dim rowNum As Long, nonZeroFound As Boolean: nonZeroFound = False
+            For rowNum = 3 To lastRow
+                If IsNumeric(sellerWs.Cells(rowNum, ceclCol).Value) And sellerWs.Cells(rowNum, ceclCol).Value <> 0 Then
+                    nonZeroFound = True: Exit For
+                End If
+            Next rowNum
+
+            If nonZeroFound Then
+                For rowNum = 2 To lastRow
+                    If IsNumeric(sellerWs.Cells(rowNum, ceclCol).Value) Then
+                        total = total + sellerWs.Cells(rowNum, ceclCol).Value
+                    End If
+                Next rowNum
+                macroWs.Range("AH2").Value = total
+            ElseIf IsNumeric(sellerWs.Cells(2, ceclCol).Value) Then
+                macroWs.Range("AH2").Value = sellerWs.Cells(2, ceclCol).Value
+            End If
+        End If
+
+        xlApp.Run "'" & MacroFile & "'!" & MacroName '-- Run the macro
+        savePath = outputPath & poolID & "_Processed_" & Format(Now(), "yyyymmdd_hhnnss") & ".xlsx"
+        macroWb.SaveAs savePath, FileFormat:=51 '-- Save processed file
+        sellerWb.Close False: macroWb.Close False '-- Close both files
+        Name incomingPath & FileName As archivePath & FileName '-- Move original to archive
+
+        '-- Open processed file for validation
+        Dim checkWb As Object, checkWs As Object
+        Set checkWb = xlApp.Workbooks.Open(savePath)
+        Set checkWs = checkWb.Sheets(1)
+
+        '-- Search for formula column where all values = 0
+        Dim checkCol As Long, checkRow As Long, fCount As Long, zCount As Long, colToDelete As Long
+        For checkCol = 1 To checkWs.UsedRange.Columns.Count
+            fCount = 0: zCount = 0
+            For checkRow = 2 To checkWs.Cells(checkWs.Rows.Count, checkCol).End(-4162).Row
+                If checkWs.Cells(checkRow, checkCol).HasFormula Then
+                    fCount = fCount + 1
+                    If Abs(checkWs.Cells(checkRow, checkCol).Value) < 0.0001 Then zCount = zCount + 1
+                End If
+            Next checkRow
+            If fCount > 0 And fCount = zCount Then colToDelete = checkCol: Exit For
+        Next checkCol
+
+        '-- If column found with only 0 formulas, delete and move to SQL folder
+        If colToDelete > 0 Then
+            checkWs.Columns(colToDelete).Delete
+            checkWb.SaveAs sqlReadyPath & shortPoolID & ".xlsx", FileFormat:=51
+            MsgBox "? " & shortPoolID & " saved to SQL Ready folder."
+        Else
+            '-- Else, mark as rejected
+            FileCopy savePath, rejectPath & Mid(savePath, InStrRev(savePath, "\") + 1)
+            Dim logFile As Integer: logFile = FreeFile
+            Open rejectPath & "reject_log.txt" For Append As #logFile
+            Print #logFile, Now & " - Rejected: " & savePath
+            Close #logFile
+        End If
+        checkWb.Close False
+
+SkipFile:
+        FileName = Dir '-- Move to next file
+    Loop
+
+    xlApp.Quit: Set xlApp = Nothing '-- Quit Excel and clean up
+    MsgBox "? All seller files processed and validated!"
+    ProcessAllSellerFiles = True
+    Exit Function
+
+HandleError:
+    MsgBox "? Error: " & Err.Description '-- Show error if something breaks
+    If Not xlApp Is Nothing Then xlApp.Quit
+    Set xlApp = Nothing
+    Resume Next
+End Function
+
